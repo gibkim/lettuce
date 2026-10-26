@@ -27,7 +27,6 @@ import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisException;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.codec.RedisCodec;
-import io.lettuce.core.event.jfr.EventRecorder;
 import io.lettuce.core.internal.Futures;
 import io.lettuce.core.models.role.RedisNodeDescription;
 import io.netty.util.internal.logging.InternalLogger;
@@ -67,7 +66,8 @@ class SentinelConnector<K, V> implements MasterReplicaConnector<K, V> {
         MasterReplicaConnectionProvider<K, V> connectionProvider = new MasterReplicaConnectionProvider<>(redisClient, codec,
                 redisURI, Collections.emptyMap());
 
-        Runnable runnable = getTopologyRefreshRunnable(refresh, connectionProvider);
+        SentinelTopologyRefreshTask refreshTask = new SentinelTopologyRefreshTask(redisURI, refresh, connectionProvider,
+                redisClient.getResources());
 
         return Futures.unwrapExceptions(refresh.getNodesAsync(redisURI).thenCompose(nodes -> {
 
@@ -75,13 +75,13 @@ class SentinelConnector<K, V> implements MasterReplicaConnector<K, V> {
                 throw new RedisException(String.format("Cannot determine topology from %s", redisURI));
             }
 
-            return initializeConnection(codec, sentinelTopologyRefresh, connectionProvider, runnable, nodes);
+            return initializeConnection(codec, sentinelTopologyRefresh, connectionProvider, refreshTask, nodes);
         }));
     }
 
     private CompletionStage<StatefulRedisMasterReplicaConnection<K, V>> initializeConnection(RedisCodec<K, V> codec,
             SentinelTopologyRefresh sentinelTopologyRefresh, MasterReplicaConnectionProvider<K, V> connectionProvider,
-            Runnable runnable, List<RedisNodeDescription> nodes) {
+            SentinelTopologyRefreshTask refreshTask, List<RedisNodeDescription> nodes) {
 
         connectionProvider.setKnownNodes(nodes);
 
@@ -90,6 +90,7 @@ class SentinelConnector<K, V> implements MasterReplicaConnector<K, V> {
 
             @Override
             public CompletableFuture<Void> closeAsync() {
+                refreshTask.close();
                 return CompletableFuture.allOf(super.closeAsync(), sentinelTopologyRefresh.closeAsync());
             }
 
@@ -99,7 +100,7 @@ class SentinelConnector<K, V> implements MasterReplicaConnector<K, V> {
                 channelWriter, codec, redisURI.getTimeout(), redisClient.getOptions().getJsonParser());
         connection.setOptions(redisClient.getOptions());
 
-        CompletionStage<Void> bind = sentinelTopologyRefresh.bind(runnable);
+        CompletionStage<Void> bind = sentinelTopologyRefresh.bind(refreshTask);
 
         return bind.whenComplete((v, t) -> {
             if (t != null) {
@@ -113,35 +114,6 @@ class SentinelConnector<K, V> implements MasterReplicaConnector<K, V> {
             LOG.warn("Failed to close master/replica connection", ex);
             return null;
         });
-    }
-
-    private Runnable getTopologyRefreshRunnable(MasterReplicaTopologyRefresh refresh,
-            MasterReplicaConnectionProvider<K, V> connectionProvider) {
-
-        return () -> {
-            try {
-
-                LOG.debug("Refreshing topology");
-                refresh.getNodesAsync(redisURI).thenAccept(nodes -> {
-
-                    EventRecorder.getInstance().record(new MasterReplicaTopologyChangedEvent(redisURI, nodes));
-
-                    if (nodes.isEmpty()) {
-                        LOG.warn("Topology refresh returned no nodes from {}", redisURI);
-                    }
-
-                    LOG.debug("New topology: {}", nodes);
-                    connectionProvider.setKnownNodes(nodes);
-
-                }).exceptionally(t -> {
-                    LOG.error("Error during background refresh", t);
-                    return null;
-                });
-
-            } catch (Exception e) {
-                LOG.error("Error during background refresh", e);
-            }
-        };
     }
 
 }
